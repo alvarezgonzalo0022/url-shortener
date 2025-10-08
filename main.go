@@ -33,6 +33,7 @@ type URLShortener struct {
 type URL struct {
 	ID        string    `bson:"_id" json:"id"`
 	LongURL   string    `bson:"long_url" json:"long_url"`
+	User      string    `bson:"user" json:"user"`
 	Clicks    int64     `bson:"clicks" json:"clicks"`
 	CreatedAt time.Time `bson:"created_at" json:"created_at"`
 }
@@ -44,6 +45,7 @@ type StatsEvent struct {
 
 type CreateURLRequest struct {
 	LongURL string `json:"long_url"`
+	User    string `json:"user"`
 }
 
 type CreateURLResponse struct {
@@ -64,6 +66,7 @@ func NewURLShortener() (*URLShortener, error) {
 	mongoDB := getEnv("MONGO_DB", "urlshortener")
 	baseURL := getEnv("BASE_URL", "http://localhost:8080")
 
+	// Redis client
 	rdb := redis.NewClient(&redis.Options{
 		Addr:         redisURL,
 		PoolSize:     100,
@@ -77,10 +80,14 @@ func NewURLShortener() (*URLShortener, error) {
 		return nil, fmt.Errorf("redis connection failed: %w", err)
 	}
 
+	// MongoDB client
 	mongoClient, err := mongo.Connect(ctx, options.Client().
 		ApplyURI(mongoURL).
-		SetMaxPoolSize(50).
-		SetMinPoolSize(10))
+		SetMaxPoolSize(200).                // Increased from 50
+		SetMinPoolSize(50).                 // Increased from 10
+		SetMaxConnecting(20).               // Allow more simultaneous connections
+		SetMaxConnIdleTime(30*time.Second). // Close idle connections faster
+		SetTimeout(5*time.Second))          // Overall timeout
 	if err != nil {
 		return nil, fmt.Errorf("mongo connection failed: %w", err)
 	}
@@ -91,8 +98,18 @@ func NewURLShortener() (*URLShortener, error) {
 
 	collection := mongoClient.Database(mongoDB).Collection("urls")
 
-	_, err = collection.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{{Key: "created_at", Value: -1}},
+	// Create index
+	_, err = collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys: bson.D{{Key: "_id", Value: -1}},
+		},
+		{
+			Keys: bson.D{{Key: "created_at", Value: -1}},
+		},
+		{
+			Keys:    bson.D{{Key: "user", Value: 1}, {Key: "long_url", Value: 1}},
+			Options: options.Index().SetUnique(true),
+		},
 	})
 	if err != nil {
 		log.Printf("Warning: failed to create index: %v", err)
@@ -105,6 +122,7 @@ func NewURLShortener() (*URLShortener, error) {
 		baseURL:    baseURL,
 	}
 
+	// Start stats aggregator
 	go us.statsAggregator()
 
 	return us, nil
@@ -134,7 +152,11 @@ func (us *URLShortener) createURL(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "long_url is required", http.StatusBadRequest)
 		return
 	}
+	if req.User == "" {
+		req.User = "anonymous"
+	}
 
+	// Validate URL
 	if !strings.HasPrefix(req.LongURL, "http://") && !strings.HasPrefix(req.LongURL, "https://") {
 		http.Error(w, "URL must start with http:// or https://", http.StatusBadRequest)
 		return
@@ -143,43 +165,68 @@ func (us *URLShortener) createURL(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
+	// Check if this user already has this long_url
+	filter := bson.M{"user": req.User, "long_url": req.LongURL}
+	var existingDoc URL
+	err := us.mongo.FindOne(ctx, filter).Decode(&existingDoc)
+	if err == nil {
+		// Document exists, set in Redis asynchronously and return response
+		go func(shortID, longURL string) {
+			ctx := context.Background()
+			us.redis.Set(ctx, shortID, longURL, cacheTTL)
+		}(existingDoc.ID, existingDoc.LongURL)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(CreateURLResponse{
+			ShortURL: fmt.Sprintf("%s/%s", us.baseURL, existingDoc.ID),
+			ShortID:  existingDoc.ID,
+		})
+		return
+	}
+
+	// Generate unique short ID
 	var shortID string
 	for i := 0; i < 5; i++ {
-		shortID = us.generateShortID()
-		
+		shortID = us.generateShortID()			
+		// Check if exists in Redis
 		exists, _ := us.redis.Exists(ctx, shortID).Result()
 		if exists == 0 {
+			// Check MongoDB
 			count, err := us.mongo.CountDocuments(ctx, bson.M{"_id": shortID})
 			if err == nil && count == 0 {
 				break
 			}
 		}
-		
 		if i == 4 {
 			http.Error(w, "Failed to generate unique ID", http.StatusInternalServerError)
 			return
 		}
 	}
 
+	// Create URL document
 	urlDoc := URL{
 		ID:        shortID,
 		LongURL:   req.LongURL,
+		User:      req.User,
 		Clicks:    0,
 		CreatedAt: time.Now(),
 	}
 
-	_, err := us.mongo.InsertOne(ctx, urlDoc)
+	// Store in MongoDB
+	_, err = us.mongo.InsertOne(ctx, urlDoc)
 	if err != nil {
 		log.Printf("MongoDB insert error: %v", err)
 		http.Error(w, "Failed to create short URL", http.StatusInternalServerError)
 		return
 	}
 
+	// Cache in Redis
 	if err := us.redis.Set(ctx, shortID, req.LongURL, cacheTTL).Err(); err != nil {
 		log.Printf("Redis cache error: %v", err)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	// Respond				
+	w.Header().Set("Content-Type", "application/json")	
 	json.NewEncoder(w).Encode(CreateURLResponse{
 		ShortURL: fmt.Sprintf("%s/%s", us.baseURL, shortID),
 		ShortID:  shortID,
@@ -188,26 +235,30 @@ func (us *URLShortener) createURL(w http.ResponseWriter, r *http.Request) {
 
 func (us *URLShortener) redirect(w http.ResponseWriter, r *http.Request) {
 	shortID := strings.TrimPrefix(r.URL.Path, "/")
-	
+
 	if shortID == "" || shortID == "api" || strings.HasPrefix(shortID, "api/") {
 		http.NotFound(w, r)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Try Redis first
 	longURL, err := us.redis.Get(ctx, shortID).Result()
 	if err == nil {
+		// Cache hit - track stats asynchronously
 		select {
 		case us.statsQueue <- StatsEvent{ShortID: shortID, Timestamp: time.Now()}:
 		default:
+			// Queue full, skip stats
 		}
-		
+
 		http.Redirect(w, r, longURL, http.StatusMovedPermanently)
 		return
 	}
 
+	// Cache miss - query MongoDB
 	var urlDoc URL
 	err = us.mongo.FindOne(ctx, bson.M{"_id": shortID}).Decode(&urlDoc)
 	if err != nil {
@@ -220,11 +271,13 @@ func (us *URLShortener) redirect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Update cache
 	go func() {
 		ctx := context.Background()
 		us.redis.Set(ctx, shortID, urlDoc.LongURL, cacheTTL)
 	}()
 
+	// Track stats
 	select {
 	case us.statsQueue <- StatsEvent{ShortID: shortID, Timestamp: time.Now()}:
 	default:
@@ -245,7 +298,7 @@ func (us *URLShortener) getStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	var urlDoc URL
@@ -280,9 +333,10 @@ func (us *URLShortener) deleteURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
+	// Delete from MongoDB
 	result, err := us.mongo.DeleteOne(ctx, bson.M{"_id": shortID})
 	if err != nil {
 		log.Printf("MongoDB delete error: %v", err)
@@ -295,6 +349,7 @@ func (us *URLShortener) deleteURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Delete from Redis cache
 	us.redis.Del(ctx, shortID)
 
 	w.WriteHeader(http.StatusNoContent)
@@ -316,12 +371,14 @@ func (us *URLShortener) statsAggregator() {
 				continue
 			}
 
+			// Copy and clear batch
 			currentBatch := make(map[string]int64, len(batch))
 			for k, v := range batch {
 				currentBatch[k] = v
 			}
 			batch = make(map[string]int64)
 
+			// Update MongoDB in background
 			go us.updateClickStats(currentBatch)
 		}
 	}
@@ -355,7 +412,7 @@ func main() {
 
 	shortener, err := NewURLShortener()
 	if err != nil {
-		log.Fatalf("Failed to initialize URL shortener: %v", err)					
+		log.Fatalf("Failed to initialize URL shortener: %v", err)
 	}
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -371,5 +428,5 @@ func main() {
 	log.Println("Server starting on :8000")
 	if err := http.ListenAndServe(":8000", nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
-	}
+	}					
 }
