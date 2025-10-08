@@ -1,0 +1,50 @@
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - url-shortener-network
+
+  api:
+    build: .
+    environment:
+      - REDIS_URL=redis:6379
+      - MONGO_URL=mongodb://mongo:27017
+      - MONGO_DB=urlshortener
+      - BASE_URL=http://localhost:8080
+    depends_on:
+      - redis
+      - mongo
+    networks:
+      - url-shortener-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save ""
+    ports:
+      - "6379:6379"
+    networks:
+      - url-shortener-network
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - url-shortener-network
+
+networks:
+  url-shortener-network:
+    driver: bridge
+
+volumes:
+  mongo-data:
